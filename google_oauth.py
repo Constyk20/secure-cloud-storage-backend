@@ -1,4 +1,4 @@
-"""Google Drive OAuth 2.0 connection (Phase 1).
+"""Google Drive OAuth 2.0 connection.
 
 Endpoints:
   POST /google/connect     (Bearer) -> {"authorization_url": "..."}
@@ -6,7 +6,7 @@ Endpoints:
   GET  /google/status      (Bearer) -> connection status (?verify=true forces a token refresh)
   POST /google/disconnect  (Bearer) -> revokes at Google and deletes stored credentials
 
-Phase 2 will call get_valid_access_token(user_id) to talk to the Drive API.
+google_drive.py calls get_valid_access_token(user_id) to talk to the Drive API.
 Tokens never leave the backend.
 """
 import base64
@@ -54,16 +54,20 @@ def _as_utc(value: datetime) -> datetime:
     return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
 
 
-def _error(code: str, message: str, http_status: int = 409) -> HTTPException:
+def api_error(code: str, message: str, http_status: int = 409) -> HTTPException:
     # Deliberately never 401: the frontend treats 401 as "app session expired".
     return HTTPException(status_code=http_status, detail={"code": code, "message": message})
 
 
-def _log(event: str, user_id: str, details: str) -> None:
+def log_security_event(event: str, user_id: str, details: str) -> None:
     # Never put tokens or codes in here.
     get_database().security_logs.insert_one(
         {"event": event, "user_id": user_id, "details": details, "created_at": _utcnow()}
     )
+
+
+def _drive_file_count(user_id: str) -> int:
+    return get_database().files.count_documents({"owner_id": user_id, "storage_provider": "google_drive"})
 
 
 def _token_key() -> bytes:
@@ -80,11 +84,11 @@ def _ensure_configured() -> None:
         and settings.GOOGLE_REDIRECT_URI
         and settings.GOOGLE_TOKEN_ENCRYPTION_KEY
     ):
-        raise _error("google_not_configured", "Google Drive integration is not configured on the server", 503)
+        raise api_error("google_not_configured", "Google Drive integration is not configured on the server", 503)
     try:
         _token_key()
     except ValueError:
-        raise _error("google_not_configured", "GOOGLE_TOKEN_ENCRYPTION_KEY is invalid", 503)
+        raise api_error("google_not_configured", "GOOGLE_TOKEN_ENCRYPTION_KEY is invalid", 503)
 
 
 def _aad(user_id: str, purpose: str) -> bytes:
@@ -118,7 +122,7 @@ def _post_form(url: str, data: dict) -> httpx.Response:
     try:
         return httpx.post(url, data=data, timeout=HTTP_TIMEOUT)
     except httpx.HTTPError:
-        raise _error("google_unreachable", "Could not reach Google. Please try again shortly.", 503)
+        raise api_error("google_unreachable", "Could not reach Google. Please try again shortly.", 503)
 
 
 def _revoke_token(token: str) -> bool:
@@ -138,7 +142,7 @@ def _redirect(result: str, reason: str | None = None) -> RedirectResponse:
     return RedirectResponse(url, status_code=303, headers={"Cache-Control": "no-store"})
 
 
-def _mark_reauth_required(user_id: str) -> None:
+def mark_reauth_required(user_id: str) -> None:
     get_database().google_connections.update_one(
         {"user_id": user_id},
         {
@@ -146,10 +150,10 @@ def _mark_reauth_required(user_id: str) -> None:
             "$unset": {"refresh_token_enc": "", "access_token_enc": "", "access_token_expires_at": ""},
         },
     )
-    _log("google_reauth_required", user_id, "authorization expired or revoked")
+    log_security_event("google_reauth_required", user_id, "authorization expired or revoked")
 
 
-# ------------------------------------------------------------- token access (for Phase 2)
+# ------------------------------------------------------------- token access (used by Drive)
 
 def get_valid_access_token(user_id: str, force_refresh: bool = False) -> str:
     """Return a usable Google access token for this app user, refreshing if needed.
@@ -162,9 +166,9 @@ def get_valid_access_token(user_id: str, force_refresh: bool = False) -> str:
     database = get_database()
     connection = database.google_connections.find_one({"user_id": user_id})
     if connection is None:
-        raise _error("google_not_connected", "Google Drive is not connected")
+        raise api_error("google_not_connected", "Google Drive is not connected")
     if connection.get("status") != "connected" or not connection.get("refresh_token_enc"):
-        raise _error("google_reauth_required", "Google Drive authorization expired or was revoked. Please reconnect.")
+        raise api_error("google_reauth_required", "Google Drive authorization expired or was revoked. Please reconnect.")
 
     expires_at = connection.get("access_token_expires_at")
     if (
@@ -181,8 +185,8 @@ def get_valid_access_token(user_id: str, force_refresh: bool = False) -> str:
     try:
         refresh_token = decrypt_secret(connection["refresh_token_enc"], user_id, "refresh_token")
     except (InvalidTag, ValueError):
-        _mark_reauth_required(user_id)
-        raise _error("google_reauth_required", "Stored Google credentials could not be read. Please reconnect.")
+        mark_reauth_required(user_id)
+        raise api_error("google_reauth_required", "Stored Google credentials could not be read. Please reconnect.")
 
     response = _post_form(
         TOKEN_URL,
@@ -201,20 +205,20 @@ def get_valid_access_token(user_id: str, force_refresh: bool = False) -> str:
         except ValueError:
             pass
         if error_code == "invalid_grant":
-            _mark_reauth_required(user_id)
-            raise _error("google_reauth_required", "Google Drive authorization expired or was revoked. Please reconnect.")
+            mark_reauth_required(user_id)
+            raise api_error("google_reauth_required", "Google Drive authorization expired or was revoked. Please reconnect.")
         if response.status_code == 429:
-            raise _error("google_rate_limited", "Google is rate limiting requests. Try again shortly.", 429)
+            raise api_error("google_rate_limited", "Google is rate limiting requests. Try again shortly.", 429)
         if response.status_code >= 500:
-            raise _error("google_unavailable", "Google is temporarily unavailable. Try again shortly.", 503)
-        raise _error("google_error", "Google rejected the token refresh request", 502)
+            raise api_error("google_unavailable", "Google is temporarily unavailable. Try again shortly.", 503)
+        raise api_error("google_error", "Google rejected the token refresh request", 502)
 
     try:
         payload = response.json()
         access_token = payload["access_token"]
         expires_in = int(payload.get("expires_in", 3600))
     except (ValueError, KeyError):
-        raise _error("google_error", "Unexpected response from Google", 502)
+        raise api_error("google_error", "Unexpected response from Google", 502)
 
     update = {
         "access_token_enc": encrypt_secret(access_token, user_id, "access_token"),
@@ -279,7 +283,7 @@ def callback(code: str | None = None, state: str | None = None, error: str | Non
 
     if error or not code:
         reason = "access_denied" if error == "access_denied" else "oauth_error"
-        _log("google_oauth_failed", user_id, reason)
+        log_security_event("google_oauth_failed", user_id, reason)
         return _redirect("error", reason)
 
     # Exchange the code (PKCE verifier proves this is the same browser flow).
@@ -303,17 +307,17 @@ def callback(code: str | None = None, state: str | None = None, error: str | Non
         expires_in = int(tokens.get("expires_in", 3600))
         granted = set(str(tokens.get("scope", "")).split())
     except (HTTPException, ValueError, KeyError):
-        _log("google_oauth_failed", user_id, "token_exchange_failed")
+        log_security_event("google_oauth_failed", user_id, "token_exchange_failed")
         return _redirect("error", "token_exchange_failed")
 
     # Users can untick permissions on the consent screen; require what we need.
     # (We do not revoke on these failure paths: that could invalidate an existing
     # working grant for the same Google account.)
     if DRIVE_FILE_SCOPE not in granted:
-        _log("google_oauth_failed", user_id, "drive_scope_missing")
+        log_security_event("google_oauth_failed", user_id, "drive_scope_missing")
         return _redirect("error", "drive_scope_missing")
     if not refresh_token:
-        _log("google_oauth_failed", user_id, "no_refresh_token")
+        log_security_event("google_oauth_failed", user_id, "no_refresh_token")
         return _redirect("error", "no_refresh_token")
 
     # Identify the linked Google account.
@@ -328,47 +332,59 @@ def callback(code: str | None = None, state: str | None = None, error: str | Non
         google_sub = str(profile["sub"])
         google_email = str(profile.get("email", ""))
     except (httpx.HTTPError, ValueError, KeyError):
-        _log("google_oauth_failed", user_id, "userinfo_failed")
+        log_security_event("google_oauth_failed", user_id, "userinfo_failed")
         return _redirect("error", "userinfo_failed")
 
     # One Google account may be linked to only one app user.
     if database.google_connections.find_one({"google_sub": google_sub, "user_id": {"$ne": user_id}}):
-        _log("google_oauth_failed", user_id, "account_in_use")
+        log_security_event("google_oauth_failed", user_id, "account_in_use")
         return _redirect("error", "account_in_use")
 
     previous = database.google_connections.find_one({"user_id": user_id})
+    switching_account = bool(
+        previous and previous.get("google_sub") and previous["google_sub"] != google_sub
+    )
+
+    # Files already stored in the old Drive would become unreachable.
+    if switching_account and database.files.count_documents(
+        {"owner_id": user_id, "storage_provider": "google_drive"}, limit=1
+    ):
+        log_security_event("google_oauth_failed", user_id, "account_has_drive_files")
+        return _redirect("error", "account_has_drive_files")
+
     now = _utcnow()
+    update = {
+        "$set": {
+            "google_sub": google_sub,
+            "google_email": google_email,
+            "scopes": sorted(granted),
+            "refresh_token_enc": encrypt_secret(refresh_token, user_id, "refresh_token"),
+            "access_token_enc": encrypt_secret(access_token, user_id, "access_token"),
+            "access_token_expires_at": now + timedelta(seconds=expires_in),
+            "status": "connected",
+            "connected_at": now,
+            "updated_at": now,
+        }
+    }
+    if switching_account:
+        update["$set"]["storage_enabled"] = False
+        update["$unset"] = {"drive_folder_id": ""}
+
     try:
-        database.google_connections.update_one(
-            {"user_id": user_id},
-            {
-                "$set": {
-                    "google_sub": google_sub,
-                    "google_email": google_email,
-                    "scopes": sorted(granted),
-                    "refresh_token_enc": encrypt_secret(refresh_token, user_id, "refresh_token"),
-                    "access_token_enc": encrypt_secret(access_token, user_id, "access_token"),
-                    "access_token_expires_at": now + timedelta(seconds=expires_in),
-                    "status": "connected",
-                    "connected_at": now,
-                    "updated_at": now,
-                }
-            },
-            upsert=True,
-        )
+        database.google_connections.update_one({"user_id": user_id}, update, upsert=True)
     except DuplicateKeyError:
-        _log("google_oauth_failed", user_id, "account_in_use")
+        log_security_event("google_oauth_failed", user_id, "account_in_use")
         return _redirect("error", "account_in_use")
 
     # Switched to a different Google account: revoke the old grant (best effort).
     # Same account: do NOT revoke, it could invalidate the grant we just created.
-    if previous and previous.get("google_sub") != google_sub and previous.get("refresh_token_enc"):
+    if switching_account and previous.get("refresh_token_enc"):
         try:
             _revoke_token(decrypt_secret(previous["refresh_token_enc"], user_id, "refresh_token"))
         except (InvalidTag, ValueError):
             pass
 
-    _log("google_connected", user_id, google_email)
+    log_security_event("google_connected", user_id, google_email)
     return _redirect("connected")
 
 
@@ -393,8 +409,16 @@ def google_status(verify: bool = False, user: dict = Depends(get_current_user)):
             verify_error = detail.get("code", "google_error")
         connection = database.google_connections.find_one({"user_id": user_id})
 
+    drive_file_count = _drive_file_count(user_id)
+
     if connection is None:
-        return {"configured": configured, "connected": False, "status": "not_connected"}
+        return {
+            "configured": configured,
+            "connected": False,
+            "status": "not_connected",
+            "storage_enabled": False,
+            "drive_file_count": drive_file_count,
+        }
 
     connection_status = connection.get("status", "connected")
     result = {
@@ -404,6 +428,8 @@ def google_status(verify: bool = False, user: dict = Depends(get_current_user)):
         "google_email": connection.get("google_email"),
         "connected_at": _as_utc(connection["connected_at"]).isoformat() if connection.get("connected_at") else None,
         "scope": "drive.file",
+        "storage_enabled": bool(connection.get("storage_enabled", False)),
+        "drive_file_count": drive_file_count,
     }
     if verify_error:
         result["verify_error"] = verify_error
@@ -414,9 +440,10 @@ def google_status(verify: bool = False, user: dict = Depends(get_current_user)):
 def disconnect(user: dict = Depends(get_current_user)):
     user_id = str(user["_id"])
     database = get_database()
+    drive_file_count = _drive_file_count(user_id)
     connection = database.google_connections.find_one({"user_id": user_id})
     if connection is None:
-        return {"disconnected": True, "revoked_at_google": False}
+        return {"disconnected": True, "revoked_at_google": False, "drive_file_count": drive_file_count}
 
     revoked = False
     if connection.get("refresh_token_enc"):
@@ -425,8 +452,9 @@ def disconnect(user: dict = Depends(get_current_user)):
         except (InvalidTag, ValueError):
             revoked = False
 
-    # Always remove local credentials, even if Google could not be reached.
+    # Always remove local credentials (this also turns Drive storage off for new uploads),
+    # even if Google could not be reached.
     database.google_connections.delete_one({"user_id": user_id})
     database.google_oauth_states.delete_many({"user_id": user_id})
-    _log("google_disconnected", user_id, "revoked" if revoked else "revoke_failed_credentials_deleted")
-    return {"disconnected": True, "revoked_at_google": revoked}
+    log_security_event("google_disconnected", user_id, "revoked" if revoked else "revoke_failed_credentials_deleted")
+    return {"disconnected": True, "revoked_at_google": revoked, "drive_file_count": drive_file_count}

@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from bson import ObjectId
 from bson.errors import InvalidId
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import Response
 
 from auth import get_current_user, unwrap_private_key
@@ -18,12 +19,21 @@ from encryption import (
     unwrap_aes_key,
     wrap_aes_key,
 )
+from google_drive import (
+    delete_ciphertext,
+    discard_ciphertext,
+    download_ciphertext,
+    upload_ciphertext,
+)
 from integrity import metadata_hmac, sha256_digest, verify_metadata_hmac, verify_plaintext
 from storage import get_storage
 
 router = APIRouter(prefix="/files", tags=["files"])
 
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
+
+PROVIDER_SUPABASE = "supabase"
+PROVIDER_DRIVE = "google_drive"
 
 
 def log_event(event: str, user_id: str, details: str) -> None:
@@ -60,7 +70,84 @@ def public_file(document: dict) -> dict:
         "uploaded_at": document["uploaded_at"].isoformat(),
         "encryption_status": "AES-256-GCM",
         "integrity_status": document.get("integrity_status", "verified_at_upload"),
+        "storage_provider": document.get("storage_provider", PROVIDER_SUPABASE),
     }
+
+
+def _drive_storage_enabled(owner_id: str) -> bool:
+    connection = get_database().google_connections.find_one({"user_id": owner_id}, {"storage_enabled": 1})
+    return bool(connection and connection.get("storage_enabled"))
+
+
+def _encrypt_and_store(user: dict, filename: str, content_type: str, plaintext: bytes) -> dict:
+    """Blocking work (crypto, network, DB). Runs in a threadpool so it never stalls the event loop."""
+    owner_id = str(user["_id"])
+    file_token = uuid.uuid4().hex
+    storage_path = f"{owner_id}/{file_token}.bin"
+
+    digest = sha256_digest(plaintext)
+    aes_key = generate_aes_key()
+    nonce = generate_nonce()
+    ciphertext = encrypt_file(plaintext, aes_key, nonce)
+    wrapped_key = wrap_aes_key(aes_key, load_public_key(user["public_key_pem"]))
+
+    nonce_b64 = base64.b64encode(nonce).decode("ascii")
+    wrapped_b64 = base64.b64encode(wrapped_key).decode("ascii")
+    tag = metadata_hmac(owner_id, storage_path, digest, nonce_b64, wrapped_b64)
+
+    provider = PROVIDER_DRIVE if _drive_storage_enabled(owner_id) else PROVIDER_SUPABASE
+
+    document = {
+        "owner_id": owner_id,
+        "filename": filename,
+        "content_type": content_type,
+        "size": len(plaintext),
+        "ciphertext_size": len(ciphertext),
+        "storage_path": storage_path,
+        "storage_provider": provider,
+        "nonce": nonce_b64,
+        "wrapped_aes_key": wrapped_b64,
+        "sha256": digest,
+        "metadata_hmac": tag,
+        "integrity_status": "verified_at_upload",
+        "uploaded_at": datetime.now(timezone.utc),
+    }
+
+    if provider == PROVIDER_DRIVE:
+        try:
+            stored = upload_ciphertext(owner_id, f"{file_token}.bin", ciphertext)
+        except HTTPException as exc:
+            code = exc.detail.get("code", "drive_error") if isinstance(exc.detail, dict) else "drive_error"
+            log_event("file_upload_failed", owner_id, code)
+            raise
+        document["drive_file_id"] = stored["drive_file_id"]
+        document["google_account_sub"] = stored["google_account_sub"]
+
+        def remove_stored() -> None:
+            discard_ciphertext(owner_id, stored["drive_file_id"])
+    else:
+        storage = get_storage()
+        storage.upload(
+            storage_path,
+            ciphertext,
+            {"content-type": "application/octet-stream", "upsert": "false"},
+        )
+
+        def remove_stored() -> None:
+            storage.remove([storage_path])
+
+    try:
+        result = get_database().files.insert_one(document)
+    except Exception:
+        try:
+            remove_stored()
+        except Exception:
+            pass
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Could not save file metadata")
+
+    document["_id"] = result.inserted_id
+    log_event("file_uploaded", owner_id, f"{filename} ({provider})")
+    return document
 
 
 @router.post("/upload", status_code=status.HTTP_201_CREATED)
@@ -74,51 +161,10 @@ async def upload_file(
     if len(plaintext) > MAX_UPLOAD_BYTES:
         raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="File exceeds 20 MB")
 
-    owner_id = str(user["_id"])
     filename = (file.filename or "upload.bin").replace("\\", "/").split("/")[-1][:180]
     content_type = file.content_type or "application/octet-stream"
-    storage_path = f"{owner_id}/{uuid.uuid4().hex}.bin"
 
-    digest = sha256_digest(plaintext)
-    aes_key = generate_aes_key()
-    nonce = generate_nonce()
-    ciphertext = encrypt_file(plaintext, aes_key, nonce)
-    wrapped_key = wrap_aes_key(aes_key, load_public_key(user["public_key_pem"]))
-
-    nonce_b64 = base64.b64encode(nonce).decode("ascii")
-    wrapped_b64 = base64.b64encode(wrapped_key).decode("ascii")
-    tag = metadata_hmac(owner_id, storage_path, digest, nonce_b64, wrapped_b64)
-
-    storage = get_storage()
-    storage.upload(
-        storage_path,
-        ciphertext,
-        {"content-type": "application/octet-stream", "upsert": "false"},
-    )
-
-    document = {
-        "owner_id": owner_id,
-        "filename": filename,
-        "content_type": content_type,
-        "size": len(plaintext),
-        "ciphertext_size": len(ciphertext),
-        "storage_path": storage_path,
-        "nonce": nonce_b64,
-        "wrapped_aes_key": wrapped_b64,
-        "sha256": digest,
-        "metadata_hmac": tag,
-        "integrity_status": "verified_at_upload",
-        "uploaded_at": datetime.now(timezone.utc),
-    }
-
-    try:
-        result = get_database().files.insert_one(document)
-    except Exception:
-        storage.remove([storage_path])
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Could not save file metadata")
-
-    document["_id"] = result.inserted_id
-    log_event("file_uploaded", owner_id, filename)
+    document = await run_in_threadpool(_encrypt_and_store, user, filename, content_type, plaintext)
     return public_file(document)
 
 
@@ -149,7 +195,14 @@ def download_file(file_id: str, user: dict = Depends(get_current_user)):
         log_event("integrity_failed", owner_id, "metadata hmac mismatch")
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Integrity verification failed")
 
-    ciphertext = get_storage().download(document["storage_path"])
+    if document.get("storage_provider", PROVIDER_SUPABASE) == PROVIDER_DRIVE:
+        ciphertext = download_ciphertext(owner_id, document["drive_file_id"], document["google_account_sub"])
+        if len(ciphertext) != document.get("ciphertext_size", len(ciphertext)):
+            log_event("integrity_failed", owner_id, "ciphertext size mismatch")
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Integrity verification failed")
+    else:
+        ciphertext = get_storage().download(document["storage_path"])
+
     private_key = unwrap_private_key(user["wrapped_private_key"])
     aes_key = unwrap_aes_key(base64.b64decode(document["wrapped_aes_key"]), private_key)
 
@@ -172,9 +225,18 @@ def download_file(file_id: str, user: dict = Depends(get_current_user)):
 
 
 @router.delete("/{file_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_file(file_id: str, user: dict = Depends(get_current_user)):
+def delete_file(file_id: str, local_only: bool = False, user: dict = Depends(get_current_user)):
     document = _owned_file(file_id, user)
     owner_id = str(user["_id"])
-    get_storage().remove([document["storage_path"]])
+
+    if document.get("storage_provider", PROVIDER_SUPABASE) == PROVIDER_DRIVE:
+        if local_only:
+            # Used when Drive is unreachable: the encrypted copy stays in the user's Drive.
+            log_event("file_removed_locally", owner_id, document["filename"])
+        else:
+            delete_ciphertext(owner_id, document["drive_file_id"], document["google_account_sub"])
+    else:
+        get_storage().remove([document["storage_path"]])
+
     get_database().files.delete_one({"_id": document["_id"], "owner_id": owner_id})
     log_event("file_deleted", owner_id, document["filename"])

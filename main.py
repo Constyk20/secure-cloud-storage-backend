@@ -9,6 +9,7 @@ from admin import router as admin_router
 from auth import router as auth_router
 from database import ensure_indexes
 from files import router as files_router
+from google_drive import router as google_storage_router
 from google_oauth import router as google_router
 from security import router as security_router
 
@@ -40,6 +41,7 @@ app.include_router(files_router)
 app.include_router(security_router)
 app.include_router(admin_router)
 app.include_router(google_router)
+app.include_router(google_storage_router)
 
 
 @app.get("/health")
