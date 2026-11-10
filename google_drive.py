@@ -28,6 +28,7 @@ router = APIRouter(prefix="/google/storage", tags=["google"])
 FILES_URL = "https://www.googleapis.com/drive/v3/files"
 UPLOAD_URL = "https://www.googleapis.com/upload/drive/v3/files"
 UPLOAD_HOST_PREFIX = "https://www.googleapis.com/"
+ABOUT_URL = "https://www.googleapis.com/drive/v3/about"
 FOLDER_NAME = "Secure Cloud Storage"
 FOLDER_MIME = "application/vnd.google-apps.folder"
 
@@ -316,3 +317,40 @@ def set_storage_preference(body: StoragePreference, user: dict = Depends(get_cur
         log_security_event("drive_storage_disabled", user_id, "new uploads use default storage")
 
     return {"storage_enabled": body.enabled}
+
+    def _to_int(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+@router.get("/quota")
+def drive_quota(user: dict = Depends(get_current_user)):
+    """Account-wide Drive quota plus how much of it this app's files use."""
+    user_id = str(user["_id"])
+    response = _drive_call(user_id, "GET", ABOUT_URL, params={"fields": "storageQuota"})
+    if response.status_code != 200:
+        _raise_for_drive(response)
+
+    quota = response.json().get("storageQuota") or {}
+    limit = _to_int(quota.get("limit"))  # absent for unlimited accounts
+
+    totals = list(
+        get_database().files.aggregate(
+            [
+                {"$match": {"owner_id": user_id, "storage_provider": "google_drive"}},
+                {"$group": {"_id": None, "bytes": {"$sum": "$ciphertext_size"}}},
+            ]
+        )
+    )
+    app_bytes = int(totals[0]["bytes"]) if totals else 0
+
+    return {
+        "limit": limit,
+        "unlimited": limit is None,
+        "usage": _to_int(quota.get("usage")),
+        "usage_in_drive": _to_int(quota.get("usageInDrive")),
+        "usage_in_trash": _to_int(quota.get("usageInDriveTrash")),
+        "app_bytes": app_bytes,
+    }
