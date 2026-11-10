@@ -318,7 +318,10 @@ def set_storage_preference(body: StoragePreference, user: dict = Depends(get_cur
 
     return {"storage_enabled": body.enabled}
 
-    def _to_int(value):
+
+# ------------------------------------------------------------------------- quota
+
+def _to_int(value):
     try:
         return int(value)
     except (TypeError, ValueError):
